@@ -49,17 +49,3 @@ token = os.getenv("DISCORD_TOKEN")
 if not token:
     raise RuntimeError("DISCORD_TOKEN environment variable is not set.")
 bot.run(token)
-
-Install the dependency:
-
-pip install discord.py
-
-Then run:
-
-python bot.py
-
-Make sure your environment contains:
-
-DISCORD_TOKEN=your_bot_token_here
-
-The /ping command will be registered globally through Discord’s application command system.

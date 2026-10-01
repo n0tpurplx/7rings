@@ -1,24 +1,29 @@
 
 import os
+import json
+import logging
+from typing import Any
+
 import aiohttp
 import discord
-
+from discord import app_commands
 from discord.ext import commands
+
+
+# ---------------- CONFIGURATION ----------------
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 ERLC_KEY = os.getenv("ERLC_KEY")
 
-API_BASE = "https://api.erlc.gg/v2"
+API_URL = "https://api.erlc.gg/v2/server"
 
-intents = discord.Intents.default()
-
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
-)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("erlc-bot")
 
 
-class ERLC:
+# ---------------- ER:LC API CLIENT ----------------
+
+class ERLCAPI:
     def __init__(self):
         self.session = None
 
@@ -26,393 +31,501 @@ class ERLC:
         self.session = aiohttp.ClientSession(
             headers={
                 "server-key": ERLC_KEY,
-                "Accept": "application/json"
+                "Accept": "application/json",
+                "User-Agent": "ERLC-Discord-Bot/1.0",
             },
-            timeout=aiohttp.ClientTimeout(total=15)
+            timeout=aiohttp.ClientTimeout(total=15),
         )
 
     async def close(self):
         if self.session:
             await self.session.close()
 
-    async def get(self, endpoint):
+    async def get_server(
+        self,
+        players=False,
+        staff=False,
+        vehicles=False,
+    ):
+        if not self.session:
+            raise RuntimeError("API session is not initialized.")
+
+        params = {}
+
+        if players:
+            params["Players"] = "true"
+
+        if staff:
+            params["Staff"] = "true"
+
+        if vehicles:
+            params["Vehicles"] = "true"
+
         async with self.session.get(
-            f"{API_BASE}/{endpoint}"
+            API_URL,
+            params=params,
         ) as response:
 
-            if response.status == 429:
-                raise RuntimeError("ER:LC API rate limit reached.")
-
-            if response.status == 401:
-                raise RuntimeError("Invalid ERLC_KEY.")
-
-            if response.status == 403:
-                raise RuntimeError("API access forbidden.")
+            body = await response.text()
 
             if response.status != 200:
                 raise RuntimeError(
-                    f"ER:LC API returned HTTP {response.status}."
+                    f"ER:LC API returned HTTP {response.status}: "
+                    f"{body[:400]}"
                 )
 
-            return await response.json()
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError:
+                raise RuntimeError("ER:LC returned invalid JSON.")
 
 
-erlc = ERLC()
+api = ERLCAPI()
 
 
-def get_value(data, *keys, default="Unknown"):
+# ---------------- DATA HELPERS ----------------
+
+def get_value(data: Any, *keys, default=None):
+    """Find a field without depending on capitalization."""
+
+    if not isinstance(data, dict):
+        return default
+
+    normalized = {
+        str(key).lower(): value
+        for key, value in data.items()
+    }
+
     for key in keys:
-        if isinstance(data, dict) and data.get(key) is not None:
-            return data[key]
+        if key.lower() in normalized:
+            return normalized[key.lower()]
 
     return default
 
 
-def format_value(value):
+def get_collection(data: Any, *names):
+    """
+    Extract a collection from a response.
+    Supports arrays, nested objects, and capitalization differences.
+    """
+
+    if isinstance(data, list):
+        return data
+
+    if not isinstance(data, dict):
+        return []
+
+    value = get_value(data, *names)
+
+    if isinstance(value, list):
+        return value
+
+    if isinstance(value, dict):
+        return list(value.values())
+
+    return []
+
+
+def display(value):
     if value is None:
         return "Unknown"
 
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+
     if isinstance(value, (dict, list)):
-        return str(value)
+        return json.dumps(value, ensure_ascii=False)
 
     return str(value)
 
 
-def make_embed(title, description=None):
-    embed = discord.Embed(
-        title=title,
-        description=description,
-        color=discord.Color.blurple()
+def add_field(embed, name, value, inline=False):
+    value = display(value)
+
+    if len(value) > 1024:
+        value = value[:1021] + "..."
+
+    embed.add_field(
+        name=name,
+        value=value,
+        inline=inline,
     )
 
-    embed.set_footer(text="EasyERLC | Read-only API")
-    return embed
+
+def make_embed(title, description=None):
+    return discord.Embed(
+        title=title,
+        description=description,
+        color=discord.Color.from_rgb(130, 75, 220),
+    )
 
 
-async def send_error(interaction, error):
-    message = f"**ER:LC API error:** {error}"
+def find_player(players, username):
+    username = username.casefold()
 
-    if interaction.response.is_done():
-        await interaction.followup.send(
-            message,
-            ephemeral=True
+    for player in players:
+        name = get_value(player, "Player", "Username", "Name")
+
+        if name and str(name).casefold() == username:
+            return player
+
+    return None
+
+
+# ---------------- BOT ----------------
+
+class ERLCBot(commands.Bot):
+
+    def __init__(self):
+        intents = discord.Intents.default()
+
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
         )
-    else:
-        await interaction.response.send_message(
-            message,
-            ephemeral=True
+
+    async def setup_hook(self):
+        await api.start()
+
+        synced = await self.tree.sync()
+
+        logger.info(
+            "Synced %s application commands.",
+            len(synced),
         )
 
+    async def close(self):
+        await api.close()
+        await super().close()
 
-@bot.event
-async def setup_hook():
-    await erlc.start()
 
-    synced = await bot.tree.sync()
-    print(f"Synced {len(synced)} slash commands")
+bot = ERLCBot()
 
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user}")
+    logger.info("Logged in as %s", bot.user)
 
+
+# ---------------- COMMANDS ----------------
 
 @bot.tree.command(
     name="server",
-    description="View ER:LC server information"
+    description="View ER:LC server information.",
 )
 async def server(interaction: discord.Interaction):
-    await interaction.response.defer()
+
+    await interaction.response.defer(thinking=True)
 
     try:
-        data = await erlc.get("server")
+        data = await api.get_server()
 
-        embed = make_embed("ER:LC Server Status")
+        embed = make_embed("ER:LC Server Information")
 
-        embed.add_field(
-            name="Server Name",
-            value=format_value(
-                get_value(data, "Name", "ServerName")
-            ),
-            inline=False
-        )
+        if isinstance(data, dict):
+            # Display scalar fields returned by the API.
+            for key, value in data.items():
 
-        embed.add_field(
-            name="Players",
-            value=format_value(
-                get_value(data, "CurrentPlayers", "Players")
-            ),
-            inline=True
-        )
+                if isinstance(value, (dict, list)):
+                    continue
 
-        embed.add_field(
-            name="Join Key",
-            value=format_value(
-                get_value(data, "JoinKey")
-            ),
-            inline=True
-        )
+                add_field(
+                    embed,
+                    str(key),
+                    value,
+                    inline=True,
+                )
+
+        if not embed.fields:
+            embed.description = "The API returned no displayable server fields."
 
         await interaction.followup.send(embed=embed)
 
-    except Exception as e:
-        await send_error(interaction, e)
+    except Exception as error:
+        logger.exception("Server command failed")
+        await interaction.followup.send(
+            f"Could not retrieve server information:\n`{str(error)[:1500]}`",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(
     name="players",
-    description="List players currently in the ER:LC server"
+    description="View players currently in the server.",
 )
-async def players(interaction: discord.Interaction):
-    await interaction.response.defer()
+async def players_command(interaction: discord.Interaction):
+
+    await interaction.response.defer(thinking=True)
 
     try:
-        data = await erlc.get("server/players")
+        data = await api.get_server(players=True)
 
-        if not isinstance(data, list):
-            raise RuntimeError("Unexpected players response format.")
+        players = get_collection(data, "Players")
 
         embed = make_embed(
-            f"Players Online ({len(data)})"
+            "Players Online",
+            f"Currently returned by the API: **{len(players)}**",
         )
 
-        if not data:
-            embed.description = "No players are currently online."
+        if not players:
+            embed.description = "No players were returned."
 
-        for player in data[:25]:
-            username = get_value(player, "Player")
-            team = get_value(player, "Team")
-            permission = get_value(player, "Permission")
+        for player in players[:25]:
+
+            name = get_value(player, "Player", "Username", "Name", default="Unknown")
+            team = get_value(player, "Team", default="Unknown")
             callsign = get_value(player, "Callsign", default="None")
 
             embed.add_field(
-                name=str(username),
+                name=str(name)[:256],
                 value=(
-                    f"**Team:** {team}\n"
-                    f"**Permission:** {permission}\n"
-                    f"**Callsign:** {callsign}"
+                    f"**Team:** {display(team)}\n"
+                    f"**Callsign:** {display(callsign)}"
                 ),
-                inline=True
+                inline=True,
             )
 
-        if len(data) > 25:
+        if len(players) > 25:
             embed.set_footer(
-                text=f"Showing 25 of {len(data)} players"
+                text=f"Showing 25 of {len(players)} players."
             )
 
         await interaction.followup.send(embed=embed)
 
-    except Exception as e:
-        await send_error(interaction, e)
+    except Exception as error:
+        logger.exception("Players command failed")
+        await interaction.followup.send(
+            f"Could not retrieve players:\n`{str(error)[:1500]}`",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(
     name="playerinfo",
-    description="View detailed information about an ER:LC player"
+    description="View information about a player.",
 )
+@app_commands.describe(username="The exact in-game username")
 async def playerinfo(
     interaction: discord.Interaction,
-    username: str
+    username: str,
 ):
-    await interaction.response.defer()
+
+    await interaction.response.defer(thinking=True)
 
     try:
-        players_data = await erlc.get("server/players")
-        vehicles_data = await erlc.get("server/vehicles")
+        data = await api.get_server(
+            players=True,
+            vehicles=True,
+        )
 
-        if not isinstance(players_data, list):
-            raise RuntimeError("Unexpected players response format.")
+        player_list = get_collection(data, "Players")
+        vehicle_list = get_collection(data, "Vehicles")
 
-        if not isinstance(vehicles_data, list):
-            vehicles_data = []
+        player = find_player(player_list, username)
 
-        matches = [
-            player for player in players_data
-            if username.lower() in str(
-                get_value(player, "Player", default="")
-            ).lower()
-        ]
-
-        if not matches:
+        if not player:
             await interaction.followup.send(
-                f"No online player matching `{username}` was found.",
-                ephemeral=True
+                f"Player `{username}` was not found in the server.",
+                ephemeral=True,
             )
             return
 
-        player = matches[0]
-
-        player_name = get_value(player, "Player")
-
-        owned_vehicles = [
-            vehicle for vehicle in vehicles_data
-            if str(get_value(
-                vehicle, "Owner", "Player", default=""
-            )).lower() == str(player_name).lower()
-        ]
+        name = get_value(player, "Player", "Username", "Name", default=username)
 
         embed = make_embed(
-            f"Player Information: {player_name}"
+            f"Player Information: {name}"
         )
 
-        embed.add_field(
-            name="Player",
-            value=str(player_name),
-            inline=False
-        )
+        add_field(embed, "Team", get_value(player, "Team"))
+        add_field(embed, "Callsign", get_value(player, "Callsign"))
+        add_field(embed, "Permission", get_value(player, "Permission"))
 
-        embed.add_field(
-            name="Team",
-            value=format_value(get_value(player, "Team")),
-            inline=True
-        )
+        wanted = get_value(player, "WantedStars")
 
-        embed.add_field(
-            name="Permission",
-            value=format_value(get_value(player, "Permission")),
-            inline=True
-        )
+        if wanted is not None:
+            add_field(embed, "Wanted Stars", wanted)
 
-        embed.add_field(
-            name="Callsign",
-            value=format_value(
-                get_value(player, "Callsign", default="None")
-            ),
-            inline=True
-        )
+        location = get_value(player, "Location")
 
-        embed.add_field(
-            name="Wanted Status",
-            value=format_value(
-                get_value(player, "Wanted", "IsWanted")
-            ),
-            inline=True
-        )
+        if location is not None:
+            if isinstance(location, dict):
+                postal = get_value(location, "Postal", "PostalCode")
+                street = get_value(location, "Street", "StreetName")
+                building = get_value(location, "Building", "BuildingNumber")
+                x = get_value(location, "X")
+                y = get_value(location, "Y")
 
-        embed.add_field(
-            name="In-game Location",
-            value=format_value(
-                get_value(player, "Location", "Position")
-            ),
-            inline=True
-        )
+                location_parts = []
+
+                if postal is not None:
+                    location_parts.append(f"Postal: {postal}")
+
+                if street is not None:
+                    location_parts.append(f"Street: {street}")
+
+                if building is not None:
+                    location_parts.append(f"Building: {building}")
+
+                if x is not None or y is not None:
+                    location_parts.append(f"Coordinates: {x}, {y}")
+
+                add_field(
+                    embed,
+                    "Location",
+                    "\n".join(location_parts) or display(location),
+                )
+            else:
+                add_field(embed, "Location", location)
+
+        owned_vehicles = []
+
+        for vehicle in vehicle_list:
+            owner = get_value(vehicle, "Owner")
+
+            if owner and str(owner).casefold() == str(name).casefold():
+                owned_vehicles.append(vehicle)
 
         if owned_vehicles:
-            vehicle_lines = []
+            vehicle_text = []
 
             for vehicle in owned_vehicles[:10]:
-                vehicle_name = get_value(
-                    vehicle, "Name", "Vehicle"
+                vehicle_name = get_value(vehicle, "Name", default="Unknown")
+                plate = get_value(vehicle, "Plate", default="Unknown")
+
+                vehicle_text.append(
+                    f"**{vehicle_name}**\nPlate: `{plate}`"
                 )
 
-                texture = get_value(
-                    vehicle, "Texture", default="Default"
-                )
-
-                vehicle_lines.append(
-                    f"**{vehicle_name}**\nTexture: {texture}"
-                )
-
-            vehicle_text = "\n\n".join(vehicle_lines)
+            add_field(
+                embed,
+                "Spawned Vehicle(s)",
+                "\n\n".join(vehicle_text),
+            )
         else:
-            vehicle_text = "No matching vehicle information available."
-
-        embed.add_field(
-            name="Owned / Associated Vehicles",
-            value=vehicle_text[:1024],
-            inline=False
-        )
-
-        embed.timestamp = discord.utils.utcnow()
+            add_field(
+                embed,
+                "Spawned Vehicle(s)",
+                "No matching spawned vehicle was returned.",
+            )
 
         await interaction.followup.send(embed=embed)
 
-    except Exception as e:
-        await send_error(interaction, e)
+    except Exception as error:
+        logger.exception("Player info command failed")
+        await interaction.followup.send(
+            f"Could not retrieve player information:\n`{str(error)[:1500]}`",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(
     name="vehicles",
-    description="View vehicle information from the ER:LC server"
+    description="View currently spawned vehicles.",
 )
-async def vehicles(interaction: discord.Interaction):
-    await interaction.response.defer()
+async def vehicles_command(interaction: discord.Interaction):
+
+    await interaction.response.defer(thinking=True)
 
     try:
-        data = await erlc.get("server/vehicles")
+        data = await api.get_server(vehicles=True)
 
-        if not isinstance(data, list):
-            raise RuntimeError("Unexpected vehicles response format.")
+        vehicles = get_collection(data, "Vehicles")
 
         embed = make_embed(
-            f"Server Vehicles ({len(data)})"
+            "Spawned Vehicles",
+            f"Vehicles returned by the API: **{len(vehicles)}**",
         )
 
-        if not data:
-            embed.description = "No vehicle records returned."
+        if not vehicles:
+            embed.description = "No vehicles were returned."
 
-        for vehicle in data[:25]:
+        for vehicle in vehicles[:25]:
+
+            name = get_value(vehicle, "Name", default="Unknown")
+            owner = get_value(vehicle, "Owner", default="Unknown")
+            plate = get_value(vehicle, "Plate", default="Unknown")
+            color = get_value(vehicle, "ColorName", default="Unknown")
+
             embed.add_field(
-                name=format_value(
-                    get_value(vehicle, "Name", "Vehicle")
-                ),
+                name=str(name)[:256],
                 value=(
-                    f"**Owner:** {get_value(vehicle, 'Owner', 'Player')}\n"
-                    f"**Texture:** {get_value(vehicle, 'Texture')}"
+                    f"**Owner:** {display(owner)}\n"
+                    f"**Plate:** {display(plate)}\n"
+                    f"**Color:** {display(color)}"
                 ),
-                inline=True
+                inline=True,
             )
 
         await interaction.followup.send(embed=embed)
 
-    except Exception as e:
-        await send_error(interaction, e)
+    except Exception as error:
+        logger.exception("Vehicles command failed")
+        await interaction.followup.send(
+            f"Could not retrieve vehicles:\n`{str(error)[:1500]}`",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(
     name="staff",
-    description="View online ER:LC staff"
+    description="View server staff.",
 )
-async def staff(interaction: discord.Interaction):
-    await interaction.response.defer()
+async def staff_command(interaction: discord.Interaction):
+
+    await interaction.response.defer(thinking=True)
 
     try:
-        data = await erlc.get("server/players")
+        data = await api.get_server(staff=True)
 
-        staff_members = [
-            player for player in data
-            if str(get_value(
-                player, "Permission", default=""
-            )).lower() not in ("none", "normal", "unknown")
-        ]
+        staff_members = get_collection(data, "Staff")
 
         embed = make_embed(
-            f"Online Staff ({len(staff_members)})"
+            "Server Staff",
+            f"Staff entries returned: **{len(staff_members)}**",
         )
 
         if not staff_members:
-            embed.description = "No staff members identified."
+            embed.description = "No staff entries were returned."
 
         for member in staff_members[:25]:
+
+            name = get_value(
+                member,
+                "Player",
+                "Username",
+                "Name",
+                default="Unknown",
+            )
+
+            permission = get_value(
+                member,
+                "Permission",
+                "Rank",
+                default="Unknown",
+            )
+
             embed.add_field(
-                name=str(get_value(member, "Player")),
-                value=(
-                    f"**Permission:** {get_value(member, 'Permission')}\n"
-                    f"**Team:** {get_value(member, 'Team')}"
-                ),
-                inline=True
+                name=str(name)[:256],
+                value=f"**Permission:** {display(permission)}",
+                inline=True,
             )
 
         await interaction.followup.send(embed=embed)
 
-    except Exception as e:
-        await send_error(interaction, e)
+    except Exception as error:
+        logger.exception("Staff command failed")
+        await interaction.followup.send(
+            f"Could not retrieve staff:\n`{str(error)[:1500]}`",
+            ephemeral=True,
+        )
 
+
+# ---------------- START ----------------
 
 if not DISCORD_TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing.")
+    raise RuntimeError("Missing DISCORD_TOKEN environment variable.")
 
 if not ERLC_KEY:
-    raise RuntimeError("ERLC_KEY is missing.")
+    raise RuntimeError("Missing ERLC_KEY environment variable.")
 
 bot.run(DISCORD_TOKEN)
